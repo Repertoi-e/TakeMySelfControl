@@ -1,3 +1,9 @@
 {
-    "size": 10
+    "rotation_torque": 9000.0,
+    "motor_force": 1800.0,
+    "friction": 0.9,
+    "drag": 0.9,
+    "directory": "/Users/soti/DevLocal/SourceCode",
+    "run_command": "",
+    "build_command": "sh ./build.sh"
 }

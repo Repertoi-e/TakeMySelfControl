@@ -1,4 +1,4 @@
-from PySide6.QtGui import QFont
+from PySide6.QtGui import (QPainter)
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -17,9 +17,90 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QSizePolicy,
 )
+from PySide6.QtCore import Qt, QRect
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+
+class PgWidget(QWidget):
+    painting: bool = False
+    drag_id: int = 0
+
+    def __init__(self, uber):
+        super().__init__()
+        self.uber = uber
+
+    def widget_to_image_coords(self, pos):
+        if not hasattr(self.uber, "pg_image"):
+            return None
+
+        image = self.uber.pg_image
+        widget_rect = self.rect()
+        image_ratio = image.width() / image.height()
+        widget_ratio = widget_rect.width() / widget_rect.height()
+
+        if widget_ratio > image_ratio:
+            target_height = widget_rect.height()
+            target_width = int(target_height * image_ratio)
+        else:
+            target_width = widget_rect.width()
+            target_height = int(target_width / image_ratio)
+
+        x = (widget_rect.width() - target_width) // 2
+        y = (widget_rect.height() - target_height) // 2
+        target_rect = QRect(x, y, target_width, target_height)
+
+        if target_rect.contains(pos):
+            relative_x = (pos.x() - target_rect.x()) / target_rect.width()
+            relative_y = (pos.y() - target_rect.y()) / target_rect.height()
+            image_x = int(relative_x * image.width())
+            image_y = int(relative_y * image.height())
+            return image_x, image_y
+        return None
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            coords = self.widget_to_image_coords(event.pos())
+            if coords:
+                self.drag_id += 1
+                self.uber.mouse_pressed_in_game(*coords, self.drag_id)
+                self.painting = True  # Flag to indicate painting has started
+
+    def mouseMoveEvent(self, event):
+        if self.painting and event.buttons() & Qt.LeftButton:
+            coords = self.widget_to_image_coords(event.pos())
+            if coords:
+                self.uber.mouse_pressed_in_game(*coords, self.drag_id)  # Or use a dedicated "drag" function
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.painting = False
+
+    def paintEvent(self, event):
+        if hasattr(self.uber, "pg_image"):
+            image = self.uber.pg_image
+
+            painter = QPainter(self)
+            widget_rect = self.rect()
+            image_ratio = image.width() / image.height()
+            widget_ratio = widget_rect.width() / widget_rect.height()
+
+            # Determine scaled target rect that preserves aspect ratio
+            if widget_ratio > image_ratio:
+                # Widget is too wide, limit by height
+                target_height = widget_rect.height()
+                target_width = int(target_height * image_ratio)
+            else:
+                # Widget is too tall, limit by width
+                target_width = widget_rect.width()
+                target_height = int(target_width / image_ratio)
+
+            x = (widget_rect.width() - target_width) // 2
+            y = (widget_rect.height() - target_height) // 2
+            target_rect = widget_rect.adjusted(x, y, -x, -y)
+
+            painter.drawImage(target_rect, image)
 
 
 class Tab(QFormLayout):
@@ -28,7 +109,7 @@ class Tab(QFormLayout):
         self.uber = uber
         self.name = name
 
-    def create_input_box(self, label, attr):
+    def create_input_box(self, label, attr, max_width=100, is_float=True):
         label = QLabel(f"{label}: ")
 
         initial_value = getattr(self.uber.mission, attr, 0)
@@ -36,12 +117,15 @@ class Tab(QFormLayout):
 
         line_edit = QLineEdit()
         line_edit.setText(str(initial_value))
-        line_edit.setMaximumWidth(100)
-        line_edit.setMinimumWidth(100)
+        line_edit.setMaximumWidth(max_width)
+        line_edit.setMinimumWidth(max_width)
 
         def on_editing_finished():
             try:
-                value = float(line_edit.text())
+                if is_float:
+                    value = float(line_edit.text())
+                else:
+                    value = line_edit.text()
                 setattr(self.uber.mission, attr, value)
                 self.uber.recalculate()
                 self.uber.unsaved_changes = True
@@ -114,21 +198,11 @@ class Tab(QFormLayout):
         self.tab_layout.addWidget(plot_widget)
 
     def _setup_pygame_window(self):
-        import pygame
-        import threading
+        self.pg_widget = PgWidget(self.uber)
+        self.pg_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tab_layout.addWidget(self.pg_widget)
 
-        def pygame_loop():
-            pygame.init()
-            screen = pygame.display.set_mode((640, 480))
-            pygame.display.set_caption("Pygame Plot")
-            running = True
-            while running:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                screen.fill((255, 255, 255))
-                pygame.draw.line(screen, (255, 0, 0), (100, 100), (500, 400))
-                pygame.display.flip()
-            pygame.quit()
+    def update_frame(self):
+        if self.pg_widget:
+            self.pg_widget.update()
 
-        threading.Thread(target=pygame_loop, daemon=True).start()
