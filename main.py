@@ -24,7 +24,7 @@ plt.style.use('dark_background')
 LOAD_DEFAULT = True
 DEFAULT_FILE = "default_mission.json"
 
-DONT_PROMPT_UNSAVED = True
+DONT_PROMPT_UNSAVED = False
 
 tabs = ['view', 'config']
 for m in tabs:
