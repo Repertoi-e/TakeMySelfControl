@@ -146,19 +146,16 @@ class Cell:
             Direction.LEFT: None
         }
         
+SCALE = 64 / 18
+
 CELL_COUNT = 16
-CELL_SIZE = 64
+CELL_SIZE = 18 * SCALE
 WALL_THICKNESS = 4
 
 MAZE_SIZE = CELL_COUNT * CELL_SIZE + WALL_THICKNESS * 3
 
-gravity = 9.81 * 100 # centi meters per second squared
-
 def cross_scalar(s, v):
 	return [-s * v[1], s * v[0]]
-
-def angle_diff(a, b):
-    return ((a - b + np.pi) % (2 * np.pi)) - np.pi
 
 class KalmanFilter:
     def __init__(self, initial_pos, initial_theta):
@@ -263,7 +260,7 @@ def update_tof_sensor_data(sensor_data, pos, rot, walls):
     closest_point_per_sensor = [np.zeros(2) for _ in range(5)]
 
     ANGLE_OFFSETS = [0, np.pi / 2, -np.pi / 2, np.pi / 4, -np.pi / 4]
-    angle_noise = np.random.normal(0, 0.001, 5)  # Small noise for angles
+    # angle_noise = np.random.normal(0, 0.001, 5)  # Small noise for angles
 
     # Check intersection with all walls
     for aabb in walls:
@@ -288,7 +285,7 @@ def update_tof_sensor_data(sensor_data, pos, rot, walls):
             )
 
         for dir in range(5):
-            angle = -rot + ANGLE_OFFSETS[dir] + angle_noise[dir] 
+            angle = -rot + ANGLE_OFFSETS[dir] # + angle_noise[dir] 
             ray_dir = np.array([math.sin(angle), -math.cos(angle)])  
             ip = ray_segment_new(pos, ray_dir, wall_segment)
 
@@ -301,9 +298,16 @@ def update_tof_sensor_data(sensor_data, pos, rot, walls):
     for dir, point in enumerate(closest_point_per_sensor):
         if point is not None:
             distance = np.linalg.norm(point - pos)
-            noise_magnitude = 0.01 * distance
+            noise_magnitude = 0.005 * distance
             noise = np.random.normal(0, noise_magnitude, 2)
             sensor_data[dir] = point + noise    
+
+NOISE_MAG = 0.05
+
+class Action(Enum):
+    MOVE_FORWARD = 0
+    TURN_LEFT = 1
+    TURN_RIGHT = 2
 
 class Mouse(Body):
     image: pg.Surface
@@ -316,9 +320,24 @@ class Mouse(Body):
 
         self.true_v = 0
         self.true_omega = 0
-        
-        self.wheel_radius = 20  # cm
-        self.wheel_base = 10    # cm (distance between wheels)
+        self.left_rpm = 0.0
+        self.right_rpm = 0.0
+        self.cell_x = 0
+        self.cell_y = 0
+
+        self.target_cell = None
+        self.target_theta = None
+
+        # For linear PID
+        self.linear_integrator = 0.0
+        self.linear_prev_error = 0.0
+
+        # For angular PID
+        self.angular_integrator = 0.0
+        self.angular_prev_error = 0.0
+
+        self.start_front_tof = None
+        self.est_theta = 0
         
         self.kalman = KalmanFilter(initial_pos=np.zeros(2), initial_theta=np.pi/2)  # 60 FPS
 
@@ -327,29 +346,182 @@ class Mouse(Body):
         self.image = pg.image.load("sprite.png").convert_alpha()
 
     def handle_input(self, keys):
-        if keys[pg.K_w] or keys[pg.K_s]:
-            sign = 1 if keys[pg.K_w] else -1
-            
-            # Move forward in the current facing direction
-            force = np.array([0, -self.u.motor_force * sign])
+        self.left_rpm = 0.0
+        self.right_rpm = 0.0
 
-            angle = -self.rot
-            rotation_matrix = np.array([[math.cos(angle), -math.sin(angle)],
-                                         [math.sin(angle), math.cos(angle)]])
-            force = np.dot(rotation_matrix, force)
+        if keys[Qt.Key_W]:
+            self.left_rpm += self.u.move_rpm
+            self.right_rpm += self.u.move_rpm
+        if keys[Qt.Key_S]:
+            self.left_rpm -= self.u.move_rpm
+            self.right_rpm -= self.u.move_rpm
+        if keys[Qt.Key_A]:
+            self.right_rpm += self.u.turn_rpm
+            self.left_rpm -= self.u.turn_rpm
+        if keys[Qt.Key_D]:
+            self.right_rpm -= self.u.turn_rpm
+            self.left_rpm += self.u.turn_rpm
+        if keys[Qt.Key_I]:
+            self.move_forward_one_cell()
+        if keys[Qt.Key_J]:
+            self.turn_left()
+        if keys[Qt.Key_L]:
+            self.turn_right()
 
-            apply_force(self, force)
+    def is_wall_front(self): 
+        front_tof = self.sensor_data[TOFDirection.FRONT.value]
+        if front_tof is not None:
+            distance = np.linalg.norm(front_tof - self.pos)
+            return distance < 0.8 * CELL_SIZE
+        
+    def is_wall_left(self):
+        left_tof = self.sensor_data[TOFDirection.LEFT.value]
+        if left_tof is not None:
+            distance = np.linalg.norm(left_tof - self.pos)
+            return distance < 0.8 * CELL_SIZE
+        
+    def is_wall_right(self):
+        right_tof = self.sensor_data[TOFDirection.RIGHT.value]
+        if right_tof is not None:
+            distance = np.linalg.norm(right_tof - self.pos)
+            return distance < 0.8 * CELL_SIZE
+        
+    def rot_to_direction(self):
+        angle = self.rot % (2 * np.pi)
+        if angle < np.pi / 4 or angle > 7 * np.pi / 4:
+            return Direction.TOP
+        elif angle > np.pi / 4 and angle < 3 * np.pi / 4:
+            return Direction.LEFT
+        elif angle > 3 * np.pi / 4 and angle < 5 * np.pi / 4:
+            return Direction.BOTTOM
+        else:
+            return Direction.RIGHT
 
-        if keys[pg.K_a]:
-            self.torque += self.u.rotation_torque
+    def move_forward_one_cell(self):
+        if self.is_wall_front():
+            print("Cannot move forward, wall detected!")
+            return
+        
+        if self.target_cell is not None:
+            return
+        
+        direction = self.rot_to_direction()
+        if direction == Direction.TOP:
+            self.target_cell = (self.cell_x, self.cell_y - 1)
+        elif direction == Direction.RIGHT:
+            self.target_cell = (self.cell_x + 1, self.cell_y)
+        elif direction == Direction.BOTTOM:
+            self.target_cell = (self.cell_x, self.cell_y + 1)
+        else:
+            self.target_cell = (self.cell_x - 1, self.cell_y)
 
-        if keys[pg.K_d]:
-            self.torque += -self.u.rotation_torque
+        self.start_front_tof = np.linalg.norm(self.pos - self.sensor_data[TOFDirection.FRONT.value]) 
+
+    def turn_left(self):
+        if self.target_cell is not None:
+            return
+        
+        self.target_theta = (self.est_theta + np.pi / 2) % (2 * np.pi)
+
+    def turn_right(self):
+        if self.target_cell is not None:
+            return
+        
+        self.target_theta = (self.est_theta - np.pi / 2) % (2 * np.pi)
 
     def update(self, dt, renderer):
         ensure_transformed_shape(self)
 
-        self.noise_mag = 0
+        # Control:
+        if self.target_cell is not None:
+            front_dist = np.linalg.norm(self.pos - self.sensor_data[TOFDirection.FRONT.value]) 
+            remaining_dist = CELL_SIZE - abs(self.start_front_tof - front_dist)
+            
+            print("Remaining distance to target cell:", remaining_dist)
+            
+            # PID gains
+            Kp = 1.0
+            Ki = 3.0
+            Kd = 0.5  # Derivative gain, tweak this
+
+            error = remaining_dist
+            self.linear_integrator += error * dt
+            derivative = (error - self.linear_prev_error) / dt
+
+            rpm = Kp * error + Ki * self.linear_integrator + Kd * derivative
+            rpm = np.clip(rpm, 10, self.u.move_rpm)
+
+            self.left_rpm = rpm
+            self.right_rpm = rpm
+            self.linear_prev_error = error
+
+            if remaining_dist < 0.05 * CELL_SIZE:
+                print("Reached target cell:", self.target_cell)
+                self.target_cell = None
+                self.start_front_tof = None
+                self.linear_integrator = 0.0
+                self.linear_prev_error = 0.0
+                self.left_rpm = 0
+                self.right_rpm = 0
+
+        _, _, est_theta = self.kalman.get_estimated_pose()
+        self.est_theta = est_theta % (2 * np.pi)  # Normalize to [0, 2π]
+
+        if self.target_theta is not None:
+            # Angular error in [-pi, pi]
+            error = (self.target_theta - est_theta + np.pi) % (2 * np.pi) - np.pi
+
+            # PID gains
+            Kp_theta = 3.0
+            Ki_theta = 5.0
+            Kd_theta = 1.0
+
+            self.angular_integrator += error * dt
+            derivative = (error - self.angular_prev_error) / dt
+
+            rpm_diff = Kp_theta * error + Ki_theta * self.angular_integrator + Kd_theta * derivative
+            rpm_diff = np.clip(rpm_diff, -self.u.turn_rpm, self.u.turn_rpm)
+
+            print(f"Turning to target theta: {np.rad2deg(self.target_theta)}, current: {np.rad2deg(est_theta)}, error: {np.rad2deg(error)}")
+
+            self.left_rpm = -rpm_diff
+            self.right_rpm = rpm_diff
+            self.angular_prev_error = error
+
+            if abs(error) < np.deg2rad(3):
+                print("Reached target theta:", np.rad2deg(self.target_theta))
+                self.target_theta = None
+                self.angular_integrator = 0.0
+                self.angular_prev_error = 0.0
+                self.left_rpm = 0
+                self.right_rpm = 0
+
+        #print("Is wall front:", self.is_wall_front())
+        #print("Is wall left:", self.is_wall_left())
+        #print("Is wall right:", self.is_wall_right())
+
+        self.cell_x = int((self.pos[0] - WALL_THICKNESS) // CELL_SIZE)
+        self.cell_y = int((self.pos[1] - WALL_THICKNESS) // CELL_SIZE)
+
+        #print(f"Cell: ({self.cell_x}, {self.cell_y})")
+
+        wr = self.u.wheel_radius * SCALE
+        wb = self.u.wheel_base * SCALE
+
+        # Convert to m/s and rad/s
+        v = (self.left_rpm + self.right_rpm) / 2 * (2 * math.pi * wr) / 60
+        omega = (self.right_rpm - self.left_rpm) * (2 * math.pi * wr) / (60 * wb)
+
+        # Force and torque from v and omega
+        force_body = np.array([0, -v * self.mass / dt])
+        angle = -self.rot
+        rotation_matrix = np.array([[math.cos(angle), -math.sin(angle)],
+                                    [math.sin(angle), math.cos(angle)]])
+        force_world = np.dot(rotation_matrix, force_body)
+        torque = omega * self.rot_inertia / dt
+
+        apply_force(self, force_world)
+        self.torque += torque
 
         acc = self.force * self.inv_mass
         self.vel += acc * dt
@@ -408,33 +580,27 @@ class Mouse(Body):
         self.update_with_oracle(dt)
         update_tof_sensor_data(self.sensor_data, self.pos, self.rot, renderer.walls_aabbs)
 
+
     def update_with_oracle(self, dt):
-        effective_vel = np.linalg.norm(self.vel)
-        direction_vector = np.array([-math.sin(self.rot), -math.cos(self.rot)])
+        left_rpm = self.left_rpm + random.gauss(0, 1) * NOISE_MAG
+        right_rpm = self.right_rpm + random.gauss(0, 1) * NOISE_MAG
+
+        #print(f"Left 🛞 RPM: {left_rpm:.1f}, Right 🛞 RPM: {right_rpm:.1f}")
+
+        wr = self.u.wheel_radius * SCALE
+        wb = self.u.wheel_base * SCALE
         
-        if np.dot(self.vel, direction_vector) < 0:
-            effective_vel = -effective_vel
-
-        left_rpm = ((effective_vel - self.ang_vel * self.wheel_base/2) /  (2 * math.pi * self.wheel_radius)) * 60  
-        right_rpm = ((effective_vel + self.ang_vel * self.wheel_base/2) /  (2 * math.pi * self.wheel_radius)) * 60
-
-        left_rpm += random.gauss(0, 5) * self.noise_mag  
-        right_rpm += random.gauss(0, 5) * self.noise_mag  
-
-        print(f"Left 🛞 RPM: {left_rpm:.1f}, Right 🛞 RPM: {right_rpm:.1f}")
-        # print(f"left_rpm = {left_rpm:.1f}, right_rpm = {right_rpm:.1f}")
-        
-        # Convert back to v and omega (this is what the robot would do)
+        # Reason about v and omega 
         slip_factor = 0.95  # Empirical value (0.9-1.0)
-        measured_v = slip_factor * (left_rpm + right_rpm) / 2 * (2 * math.pi * self.wheel_radius) / 60
+        measured_v = slip_factor * (left_rpm + right_rpm) / 2 * (2 * math.pi * wr) / 60
         if abs(measured_v) < 0.001:  # Threshold for "stopped"
             measured_v = 0
-        measured_omega = (right_rpm - left_rpm) / self.wheel_base * (2 * math.pi * self.wheel_radius) / 60
+        measured_omega = (right_rpm - left_rpm) / wb * (2 * math.pi * wr) / 60
         
         # Simulate IMU measurement (angular velocity with noise)
-        imu_omega = self.ang_vel + random.gauss(0, 0.1) * self.noise_mag   # rad/s noise
+        imu_omega = self.ang_vel + random.gauss(0, 0.1) * NOISE_MAG   # rad/s noise
 
-        #imu_theta = self.rot + random.gauss(0, 0.05) * self.noise_mag    # rad noise (if IMU has orientation)
+        #imu_theta = self.rot + random.gauss(0, 0.05) * NOISE_MAG    # rad noise (if IMU has orientation)
         #imu_theta = (imu_theta + np.pi) % (2 * np.pi) - np.pi  # Convert to [-π, π]
 
         # print(f"IMU Omega: {imu_omega}, IMU Theta: {imu_theta}, True Theta: {self.rot}, True Omega: {self.ang_vel}", "measured_v:", measured_v, "measured_omega:", measured_omega, "true_v:", self.true_v)
@@ -445,8 +611,8 @@ class Mouse(Body):
         self.kalman.update_gyro(imu_omega)
 
         # Using TOF for position measurement, i.e. helping the Kalman filter
-        measured_x = self.pos[0] - STARTING_POS_OFFSET[0] + random.gauss(0, 1) * self.noise_mag
-        measured_y = -(self.pos[1] - STARTING_POS_OFFSET[1]) + random.gauss(0, 1) * self.noise_mag
+        measured_x = self.pos[0] - STARTING_POS_OFFSET[0] + random.gauss(0, 1) * NOISE_MAG
+        measured_y = -(self.pos[1] - STARTING_POS_OFFSET[1]) + random.gauss(0, 1) * NOISE_MAG
 
         self.kalman.update_position(measured_x, measured_y)
 
@@ -468,8 +634,9 @@ class Mouse(Body):
             color = (255, 0, 0) if dir == 0 else (0, 255, 0)  # Front sensor in red, others in green
             pg.draw.line(surface, color, self.pos, point, 1)
             
-            # Draw distance text
-            distance = np.linalg.norm(point - self.pos)
+            # Draw distance text with proper unit
+            distance = np.linalg.norm(point - self.pos) / SCALE
+
             font = pg.font.SysFont(None, 20)
             text = font.render(f"{distance:.1f}", True, (255, 255, 255))
             text_pos = (self.pos + point) / 2
@@ -486,7 +653,7 @@ class PgRenderer:
     mouse: Mouse
 
     clock: pg.time.Clock = pg.time.Clock()
-    pressed_keys: list[bool] = [False] * 323
+    pressed_keys: list[bool] = [False] * 1000
 
     def __init__(self, uber):
         self.uber = uber
@@ -562,27 +729,11 @@ class PgRenderer:
 
     def keyPressEvent(self, event):
         key = event.key()
-
-        if key == Qt.Key_W:
-            self.pressed_keys[pg.K_w] = True
-        elif key == Qt.Key_S:
-            self.pressed_keys[pg.K_s] = True
-        elif key == Qt.Key_A:
-            self.pressed_keys[pg.K_a] = True
-        elif key == Qt.Key_D:
-            self.pressed_keys[pg.K_d] = True
+        self.pressed_keys[key] = True
 
     def keyReleaseEvent(self, event):
         key = event.key()
-
-        if key == Qt.Key_W:
-            self.pressed_keys[pg.K_w] = False
-        elif key == Qt.Key_S:
-            self.pressed_keys[pg.K_s] = False
-        elif key == Qt.Key_A:
-            self.pressed_keys[pg.K_a] = False
-        elif key == Qt.Key_D:
-            self.pressed_keys[pg.K_d] = False
+        self.pressed_keys[key] = False
 
     def refresh_walls(self):
         def add_wall(rect):

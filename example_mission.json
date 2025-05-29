@@ -1,8 +1,10 @@
 {
-    "rotation_torque": 9000.0,
-    "motor_force": 1800.0,
-    "friction": 0.9,
-    "drag": 0.9,
+    "move_rpm": 90.0,
+    "turn_rpm": 30.0,
+    "wheel_radius": 3,
+    "wheel_base": 6,
+    "friction": 0.8,
+    "drag": 0.8,
     "directory": "/Users/soti/DevLocal/SourceCode",
     "run_command": "",
     "build_command": "sh ./build.sh"
