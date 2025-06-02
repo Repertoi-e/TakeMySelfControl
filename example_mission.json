@@ -1,11 +1,10 @@
 {
-    "move_rpm": 90.0,
-    "turn_rpm": 30.0,
-    "wheel_radius": 3,
-    "wheel_base": 6,
-    "friction": 0.8,
-    "drag": 0.8,
+    "rpm_at_100_pwm": 1000.0,
+    "wasd_move_pwm": 100,
+    "wasd_turn_pwm": 50.0,
+    "wheel_radius": 2.1,
+    "wheel_base": 8.0,
     "directory": "/Users/soti/DevLocal/SourceCode",
-    "run_command": "",
+    "run_command": "./a.out",
     "build_command": "sh ./build.sh"
 }

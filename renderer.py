@@ -17,6 +17,7 @@ from physics.hit import ray_vs_segment
 import numba
 from numba.core import types
 from numba import njit
+from numba.experimental import jitclass
 from numba.np.extensions import cross2d
 
 
@@ -80,7 +81,7 @@ o---o---o---o---o---o---o---o---o---o---o---o---o---o---o---o---o
 
 maze_lines = maze.strip().split("\n")
 
-def get_walls_from_maze_for(cell_x, cell_y):
+def get_walls_from_maze_for(cell_x: int, cell_y: int):
     walls = {
         Direction.TOP: False,
         Direction.RIGHT: False,
@@ -92,7 +93,7 @@ def get_walls_from_maze_for(cell_x, cell_y):
     max_y = (len(maze_lines) - 1) // 2
     max_x = (len(maze_lines[0]) - 1) // 4
     if cell_x < 0 or cell_x > max_x or cell_y < 0 or cell_y > max_y:
-        return walls
+        return False, False, False, False
     
     # Calculate positions
     top_line = cell_y * 2
@@ -125,27 +126,28 @@ def get_walls_from_maze_for(cell_x, cell_y):
         if maze_lines[middle_line][right_col] == '|':
             walls[Direction.RIGHT] = True
     
-    return walls
+    return walls[Direction.TOP], walls[Direction.RIGHT], walls[Direction.BOTTOM], walls[Direction.LEFT]
 
+cell_spec = [
+    ('x', numba.int32),
+    ('y', numba.int32),
+    ('wall_top', numba.boolean),
+    ('wall_right', numba.boolean),
+    ('wall_bottom', numba.boolean),
+    ('wall_left', numba.boolean),
+]
 
+@jitclass(cell_spec)
 class Cell:
-    def __init__(self, x, y):
+    def __init__(self, x: int, y: int):
         self.x = x
         self.y = y
-        
-        walls = get_walls_from_maze_for(x, y)
-        self.wall_top: bool = walls[Direction.TOP]
-        self.wall_right: bool = walls[Direction.RIGHT]
-        self.wall_bottom: bool = walls[Direction.BOTTOM]
-        self.wall_left: bool = walls[Direction.LEFT]
 
-        self.last_drag_ids: dict[Direction, int] = {
-            Direction.TOP: None,
-            Direction.RIGHT: None,
-            Direction.BOTTOM: None,
-            Direction.LEFT: None
-        }
-        
+        self.wall_top = False
+        self.wall_right = False
+        self.wall_bottom = False
+        self.wall_left = False
+
 SCALE = 64 / 18
 
 CELL_COUNT = 16
@@ -157,79 +159,6 @@ MAZE_SIZE = CELL_COUNT * CELL_SIZE + WALL_THICKNESS * 3
 def cross_scalar(s, v):
 	return [-s * v[1], s * v[0]]
 
-class KalmanFilter:
-    def __init__(self, initial_pos, initial_theta):
-        # State vector: [x, y, theta, v, omega]
-        self.X = np.zeros((5, 1))
-        self.X[0:3, 0] = [initial_pos[0], initial_pos[1], initial_theta]
-        
-        # Covariance matrix (now 5x5)
-        self.P = np.eye(5) * 0.1
-        
-        # Process noise
-        self.Q = np.diag([0.01, 0.01, 0.01, 0.1, 0.1])  # Small noise for bias
-
-        # Measurement noise - separate for position and orientation
-        self.R_pos = np.diag([0.05, 0.05])  # x, y
-        self.R_gyro = np.array([[0.02]]) 
-
-    def predict(self, v, omega_meas, dt):
-        """Predict step using control inputs (v, omega)"""
-        x, y, theta, _, _ = self.X.flatten()
-
-        omega_corrected = omega_meas
-
-        # Predict next state (no angle wrapping!)
-        self.X[0] = x + v * np.cos(theta) * dt
-        self.X[1] = y + v * np.sin(theta) * dt
-        self.X[2] = theta + omega_corrected * dt  # unwrapped
-        self.X[3] = v
-        self.X[4] = omega_corrected
-
-        # Jacobian
-        F = np.eye(5)
-        F[0, 2] = -v * np.sin(theta) * dt
-        F[1, 2] = v * np.cos(theta) * dt
-        F[0, 3] = np.cos(theta) * dt
-        F[1, 3] = np.sin(theta) * dt
-        F[2, 4] = dt
-
-        self.P = F @ self.P @ F.T + self.Q
-
-    def update_position(self, x_meas, y_meas):
-        """2D position update"""
-        H = np.zeros((2, 5))
-        H[0, 0] = 1  # ∂x_meas/∂x
-        H[1, 1] = 1  # ∂y_meas/∂y
-
-        z = np.array([[x_meas], [y_meas]])
-        y = z - self.X[:2]  # Innovation
-
-        S = H @ self.P @ H.T + self.R_pos
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        self.X += K @ y
-        self.P = (np.eye(5) - K @ H) @ self.P
-
-    def update_gyro(self, omega_meas):
-        """Update step for angular velocity measurement (gyro reading)."""
-        H = np.zeros((1, 5))
-        H[0, 4] = 1  # ∂z/∂omega
-
-        z = np.array([[omega_meas]])
-        y = np.array([[omega_meas - self.X[4, 0]]])  # residual
-
-        S = H @ self.P @ H.T + self.R_gyro
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        self.X += K @ y
-        self.P = (np.eye(5) - K @ H) @ self.P
-
-    def get_estimated_pose(self):
-        return self.X[0, 0], self.X[1, 0], self.X[2, 0]
-
-STARTING_POS_OFFSET = np.array([0.5 * CELL_SIZE, 15.5 * CELL_SIZE])
-
 class TOFDirection(Enum):
     FRONT = 0
     LEFT = 1
@@ -237,70 +166,167 @@ class TOFDirection(Enum):
     FRONT_LEFT_45 = 3
     FRONT_RIGHT_45 = 4
 
+def fast_ray_march(
+    ray_origin_world: np.ndarray,
+    ray_dir_world: np.ndarray,
+    maze: list,  # Assuming maze is a list of lists of Cell-like objects or a Numba-compatible structure
+    MAX_SENSOR_RANGE: float
+):
+    norm_ray_dir = np.linalg.norm(ray_dir_world)
+    if norm_ray_dir < 1e-9: # Ray direction is zero vector
+        return np.array([np.nan, np.nan], dtype=np.float64)
+    ray_dir_normalized = ray_dir_world / norm_ray_dir
 
-@njit
-def ray_segment_new(ray, ray_dir, segment):
-    ray_dir = ray_dir / (np.linalg.norm(ray_dir) + 1e-6)
-    point1, point2 = segment[0], segment[1]
+    if not maze or not maze[0]: # Empty maze
+        return np.array([np.nan, np.nan], dtype=np.float64)
+    
+    maze_grid_height = len(maze)
+    maze_grid_width = len(maze[0])
 
-    # Ray-Line Segment Intersection Test in 2D
-    # http://bit.ly/1CoxdrG
-    v1 = ray - point1
-    v2 = point2 - point1
-    v3 = np.array([-ray_dir[1], ray_dir[0]])
-    t1 = cross2d(v2, v1) / (np.dot(v2, v3) + 1e-6)
-    t2 = np.dot(v1, v3) / (np.dot(v2, v3) + 1e-6)
-    if t1 >= 0.0 and t2 >= 0.0 and t2 <= 1.0:
-        return ray + t1 * ray_dir
-    return np.array([np.nan, np.nan])  # No intersection, return NaN
+    map_x = int(math.floor(ray_origin_world[0] / CELL_SIZE))
+    map_y = int(math.floor(ray_origin_world[1] / CELL_SIZE))
 
-@njit
-def update_tof_sensor_data(sensor_data, pos, rot, walls):
-    closest_distance_per_sensor = [float('inf') for _ in range(5)]
-    closest_point_per_sensor = [np.zeros(2) for _ in range(5)]
+    ray_step_x = 1 if ray_dir_normalized[0] > 0 else -1 if ray_dir_normalized[0] < 0 else 0
+    ray_step_y = 1 if ray_dir_normalized[1] > 0 else -1 if ray_dir_normalized[1] < 0 else 0
 
-    ANGLE_OFFSETS = [0, np.pi / 2, -np.pi / 2, np.pi / 4, -np.pi / 4]
-    # angle_noise = np.random.normal(0, 0.001, 5)  # Small noise for angles
+    # Handle rays parallel to axes
+    t_delta_x = abs(CELL_SIZE / ray_dir_normalized[0]) if ray_dir_normalized[0] != 0 else float('inf')
+    t_delta_y = abs(CELL_SIZE / ray_dir_normalized[1]) if ray_dir_normalized[1] != 0 else float('inf')
 
-    # Check intersection with all walls
-    for aabb in walls:
-        m = aabb[0] - aabb[1]
-        min_pt = np.array([m[0], m[1]])
-        max_pt = min_pt + np.array([aabb[1][0] * 2, aabb[1][1] * 2])
+    if ray_dir_normalized[0] > 0:
+        t_max_x = ((map_x + 1) * CELL_SIZE - ray_origin_world[0]) / ray_dir_normalized[0]
+    elif ray_dir_normalized[0] < 0:
+        t_max_x = (map_x * CELL_SIZE - ray_origin_world[0]) / ray_dir_normalized[0]
+    else:
+        t_max_x = float('inf')
+
+    if ray_dir_normalized[1] > 0:
+        t_max_y = ((map_y + 1) * CELL_SIZE - ray_origin_world[1]) / ray_dir_normalized[1]
+    elif ray_dir_normalized[1] < 0:
+        t_max_y = (map_y * CELL_SIZE - ray_origin_world[1]) / ray_dir_normalized[1]
+    else:
+        t_max_y = float('inf')
+
+    current_distance_to_boundary = 0.0
+
+    while True:
+        cell_being_exited_was_valid = (0 <= map_x < maze_grid_width) and \
+                                      (0 <= map_y < maze_grid_height)
         
-        width = max_pt[0] - min_pt[0]
-        height = max_pt[1] - min_pt[1]
+        advancing_in_x: bool
+        if t_max_x < t_max_y:
+            current_distance_to_boundary = t_max_x
+            advancing_in_x = True
+        else:
+            current_distance_to_boundary = t_max_y
+            advancing_in_x = False
+
+        if current_distance_to_boundary > MAX_SENSOR_RANGE:
+            # Ray exceeded max range before hitting a wall or exiting grid within range
+            return ray_origin_world + ray_dir_normalized * MAX_SENSOR_RANGE
+
+        # Check for wall hit if the cell we are currently in (and about to exit) is valid
+        if cell_being_exited_was_valid:
+            # Use MAZE_Y_IDX_FLIP_CONST for y-indexing transformation
+            # This assumes map_y is 0-indexed from bottom, and maze array is 0-indexed from top.
+            current_cell_y_idx = 15 - map_y
+            
+            # Ensure current_cell_y_idx is valid before accessing maze
+            if not (0 <= current_cell_y_idx < maze_grid_height):
+                 # This case should ideally not be hit if map_y was valid.
+                 # Indicates an issue with MAZE_Y_IDX_FLIP_CONST or coordinate setup.
+                 # If ray starts outside valid map_y range for indexing, treat as exiting grid.
+                 return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
+
+
+            current_cell = maze[current_cell_y_idx][map_x]
+
+            if advancing_in_x:
+                if ray_step_x > 0: # Moving Right
+                    if current_cell.wall_right:
+                        return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
+                elif ray_step_x < 0: # Moving Left
+                    if current_cell.wall_left:
+                        return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
+            else: # Advancing in Y
+                if ray_step_y > 0: # Moving "Up" in world coords (positive Y)
+                                   # Corresponds to checking 'top' wall of cell in a typical grid depiction
+                                   # or 'bottom' wall if map_y increases upwards.
+                                   # Your code: ray_step_y > 0 means moving "Down" (screen coordinates)
+                                   # maze[15-map_y] means lower map_y is higher on screen.
+                                   # So ray_step_y > 0 means map_y increases, moving "down" in array, "up" in world
+                                   # wall_top in your original code is correct for moving "down" (map_y increases) in world.
+                                   # Your current code has: Moving Down (map_y increases) -> wall_top of (map_x, map_y)
+                                   # Let's stick to your wall naming: wall_top of (map_x, map_y) means the wall at its +Y side (if Y is up).
+                                   # If ray_dir_normalized[1] > 0 (ray moves towards +Y), map_y increases. Check wall_top.
+                                   # If ray_dir_normalized[1] < 0 (ray moves towards -Y), map_y decreases. Check wall_bottom.
+                                   # Original: ray_step_y > 0 => maze[...].wall_top
+                                   # ray_step_y is based on ray_dir_normalized[1].
+                                   # if ray_dir_normalized[1] > 0, step_y = 1 (map_y increases, moving "up" in world coords) -> check wall_top of cell (map_x, map_y)
+                                   # if ray_dir_normalized[1] < 0, step_y = -1 (map_y decreases, moving "down" in world coords) -> check wall_bottom of cell (map_x, map_y)
+                        if current_cell.wall_top: # Wall at the positive Y face of cell (map_x, map_y)
+                             return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
+                elif ray_step_y < 0: # Moving "Down" in world coords (negative Y)
+                        if current_cell.wall_bottom: # Wall at the negative Y face of cell (map_x, map_y)
+                            return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
         
-        if width > height:  # Horizontal wall
-            wall_center = (min_pt + max_pt) / 2
-            wall_segment = (
-                np.array([min_pt[0], wall_center[1]]),
-                np.array([max_pt[0], wall_center[1]])
-            )
-        else:  # Vertical wall
-            wall_center = (min_pt + max_pt) / 2
-            wall_segment = (
-                np.array([wall_center[0], min_pt[1]]),
-                np.array([wall_center[0], max_pt[1]])
-            )
+        # Advance to next cell
+        if advancing_in_x:
+            map_x += ray_step_x
+            t_max_x += t_delta_x
+        else:
+            map_y += ray_step_y
+            t_max_y += t_delta_y
 
-        for dir in range(5):
-            angle = -rot + ANGLE_OFFSETS[dir] # + angle_noise[dir] 
-            ray_dir = np.array([math.sin(angle), -math.cos(angle)])  
-            ip = ray_segment_new(pos, ray_dir, wall_segment)
+        # After stepping, if the new cell (map_x, map_y) is outside the grid,
+        # the ray has exited. The current_distance_to_boundary was the distance to this exit line.
+        # This distance is guaranteed to be <= MAX_SENSOR_RANGE due to the check at the loop start.
+        if not ((0 <= map_x < maze_grid_width) and (0 <= map_y < maze_grid_height)):
+            return ray_origin_world + ray_dir_normalized * current_distance_to_boundary
 
-            if not np.isnan(ip[0]) and not np.isnan(ip[1]):
-                distance = np.linalg.norm(ip - pos)
-                if distance < closest_distance_per_sensor[dir]:
-                    closest_distance_per_sensor[dir] = distance
-                    closest_point_per_sensor[dir] = ip
+def update_tof_sensor_data_ray_marching(
+    pos: np.ndarray,
+    rot: float,
+    maze: list[list[Cell]], # Again, Numba compatibility for Cell objects
+    noise_factor: float = 0.005 # 0.5% of distance for noise std dev
+):
+    """
+    Updates ToF sensor data using fast ray marching.
+    Returns a list of 5 np.ndarrays, each representing the (noisy) intersection point [x, y]
+    or [np.nan, np.nan] if no intersection or out of range.
+    """
+    noisy_sensor_points = [np.array([np.nan, np.nan]) for _ in range(5)]
 
-    for dir, point in enumerate(closest_point_per_sensor):
-        if point is not None:
-            distance = np.linalg.norm(point - pos)
-            noise_magnitude = 0.005 * distance
-            noise = np.random.normal(0, noise_magnitude, 2)
-            sensor_data[dir] = point + noise    
+    # Angle offsets for FRONT, LEFT, RIGHT, FRONT_LEFT_45, FRONT_RIGHT_45
+    ANGLE_OFFSETS = np.array([0, np.pi / 2, -np.pi / 2, np.pi / 4, -np.pi / 4]) + np.pi/2
+    MAX_SENSOR_RANGES = np.array([255.0 / SCALE] * 5)  # Same range for all sensors
+    MAX_SENSOR_RANGES[0] = 5 * 255.0 / SCALE  # Front sensor has a longer range
+
+    for i in range(5): # For each of the 5 ToF sensors
+        angle = rot + ANGLE_OFFSETS[i]
+        
+        # Ray direction based on your convention:
+        # angle = 0 (robot front) => (0, -1) (Negative Y)
+        # angle = pi/2 (robot left) => (1, 0) (Positive X)
+        ray_dir = np.array([math.sin(angle), -math.cos(angle)])
+
+        intersection_point = fast_ray_march(
+            pos, ray_dir, maze, MAX_SENSOR_RANGES[i]
+        )
+        
+        if not np.isnan(intersection_point[0]):
+            distance = np.linalg.norm(intersection_point - pos)
+            if distance > 1e-9 : # Add noise if there's a meaningful distance
+                # Apply noise to the intersection point
+                # Noise magnitude proportional to distance
+                noise_std_dev = noise_factor * distance
+                # Generate 2D Gaussian noise
+                noise = np.random.normal(0, noise_std_dev, 2)
+                noisy_sensor_points[i] = intersection_point + noise
+            else:
+                noisy_sensor_points[i] = intersection_point # No noise if distance is zero
+
+    return noisy_sensor_points
 
 NOISE_MAG = 0.05
 
@@ -316,225 +342,154 @@ class Mouse(Body):
         super().__init__(shape=Circle(radius=CELL_SIZE // 3), density=0.001, static=False)
         self.u = uber.mission
 
-        self.pos = STARTING_POS_OFFSET.copy() 
+        self.pos = np.array([CELL_SIZE / 2, CELL_SIZE / 2])
 
-        self.true_v = 0
-        self.true_omega = 0
+        self.left_pwm = 0
+        self.right_pwm = 0
+
         self.left_rpm = 0.0
         self.right_rpm = 0.0
         self.cell_x = 0
         self.cell_y = 0
-
-        self.target_cell = None
-        self.target_theta = None
-
-        # For linear PID
-        self.linear_integrator = 0.0
-        self.linear_prev_error = 0.0
-
-        # For angular PID
-        self.angular_integrator = 0.0
-        self.angular_prev_error = 0.0
-
-        self.start_front_tof = None
-        self.est_theta = 0
-        
-        self.kalman = KalmanFilter(initial_pos=np.zeros(2), initial_theta=np.pi/2)  # 60 FPS
 
         self.sensor_data = [np.zeros(2) for _ in range(5)]
 
         self.image = pg.image.load("sprite.png").convert_alpha()
 
     def handle_input(self, keys):
-        self.left_rpm = 0.0
-        self.right_rpm = 0.0
+        self.left_pwm = 0
+        self.right_pwm = 0
 
         if keys[Qt.Key_W]:
-            self.left_rpm += self.u.move_rpm
-            self.right_rpm += self.u.move_rpm
+            self.left_pwm += self.u.wasd_move_pwm
+            self.right_pwm += self.u.wasd_move_pwm
         if keys[Qt.Key_S]:
-            self.left_rpm -= self.u.move_rpm
-            self.right_rpm -= self.u.move_rpm
+            self.left_pwm -= self.u.wasd_move_pwm
+            self.right_pwm -= self.u.wasd_move_pwm
         if keys[Qt.Key_A]:
-            self.right_rpm += self.u.turn_rpm
-            self.left_rpm -= self.u.turn_rpm
+            self.right_pwm += self.u.wasd_turn_pwm
+            self.left_pwm -= self.u.wasd_turn_pwm
         if keys[Qt.Key_D]:
-            self.right_rpm -= self.u.turn_rpm
-            self.left_rpm += self.u.turn_rpm
-        if keys[Qt.Key_I]:
-            self.move_forward_one_cell()
-        if keys[Qt.Key_J]:
-            self.turn_left()
-        if keys[Qt.Key_L]:
-            self.turn_right()
+            self.right_pwm -= self.u.wasd_turn_pwm
+            self.left_pwm += self.u.wasd_turn_pwm
 
-    def is_wall_front(self): 
-        front_tof = self.sensor_data[TOFDirection.FRONT.value]
-        if front_tof is not None:
-            distance = np.linalg.norm(front_tof - self.pos)
-            return distance < 0.8 * CELL_SIZE
+    # def is_wall_front(self): 
+    #     front_tof = self.sensor_data[TOFDirection.FRONT.value]
+    #     if front_tof is not None:
+    #         distance = np.linalg.norm(front_tof - self.pos)
+    #         return distance < 0.8 * CELL_SIZE
         
-    def is_wall_left(self):
-        left_tof = self.sensor_data[TOFDirection.LEFT.value]
-        if left_tof is not None:
-            distance = np.linalg.norm(left_tof - self.pos)
-            return distance < 0.8 * CELL_SIZE
+    # def is_wall_left(self):
+    #     left_tof = self.sensor_data[TOFDirection.LEFT.value]
+    #     if left_tof is not None:
+    #         distance = np.linalg.norm(left_tof - self.pos)
+    #         return distance < 0.8 * CELL_SIZE
         
-    def is_wall_right(self):
-        right_tof = self.sensor_data[TOFDirection.RIGHT.value]
-        if right_tof is not None:
-            distance = np.linalg.norm(right_tof - self.pos)
-            return distance < 0.8 * CELL_SIZE
+    # def is_wall_right(self):
+    #     right_tof = self.sensor_data[TOFDirection.RIGHT.value]
+    #     if right_tof is not None:
+    #         distance = np.linalg.norm(right_tof - self.pos)
+    #         return distance < 0.8 * CELL_SIZE
         
-    def rot_to_direction(self):
-        angle = self.rot % (2 * np.pi)
-        if angle < np.pi / 4 or angle > 7 * np.pi / 4:
-            return Direction.TOP
-        elif angle > np.pi / 4 and angle < 3 * np.pi / 4:
-            return Direction.LEFT
-        elif angle > 3 * np.pi / 4 and angle < 5 * np.pi / 4:
-            return Direction.BOTTOM
-        else:
-            return Direction.RIGHT
+    # def rot_to_direction(self):
+    #     angle = self.rot % (2 * np.pi)
+    #     if angle < np.pi / 4 or angle > 7 * np.pi / 4:
+    #         return Direction.TOP
+    #     elif angle > np.pi / 4 and angle < 3 * np.pi / 4:
+    #         return Direction.LEFT
+    #     elif angle > 3 * np.pi / 4 and angle < 5 * np.pi / 4:
+    #         return Direction.BOTTOM
+    #     else:
+    #         return Direction.RIGHT
 
-    def move_forward_one_cell(self):
-        if self.is_wall_front():
-            print("Cannot move forward, wall detected!")
-            return
+    # def move_forward_one_cell(self):
+    #     if self.is_wall_front():
+    #         print("Cannot move forward, wall detected!")
+    #         return
         
-        if self.target_cell is not None:
-            return
+    #     if self.target_cell is not None:
+    #         return
         
-        direction = self.rot_to_direction()
-        if direction == Direction.TOP:
-            self.target_cell = (self.cell_x, self.cell_y - 1)
-        elif direction == Direction.RIGHT:
-            self.target_cell = (self.cell_x + 1, self.cell_y)
-        elif direction == Direction.BOTTOM:
-            self.target_cell = (self.cell_x, self.cell_y + 1)
-        else:
-            self.target_cell = (self.cell_x - 1, self.cell_y)
+    #     direction = self.rot_to_direction()
+    #     if direction == Direction.TOP:
+    #         self.target_cell = (self.cell_x, self.cell_y - 1)
+    #     elif direction == Direction.RIGHT:
+    #         self.target_cell = (self.cell_x + 1, self.cell_y)
+    #     elif direction == Direction.BOTTOM:
+    #         self.target_cell = (self.cell_x, self.cell_y + 1)
+    #     else:
+    #         self.target_cell = (self.cell_x - 1, self.cell_y)
 
-        self.start_front_tof = np.linalg.norm(self.pos - self.sensor_data[TOFDirection.FRONT.value]) 
+    #     self.start_front_tof = np.linalg.norm(self.pos - self.sensor_data[TOFDirection.FRONT.value]) 
 
-    def turn_left(self):
-        if self.target_cell is not None:
-            return
+    # def turn_left(self):
+    #     if self.target_cell is not None:
+    #         return
         
-        self.target_theta = (self.est_theta + np.pi / 2) % (2 * np.pi)
+    #     self.target_theta = (self.est_theta + np.pi / 2) % (2 * np.pi)
 
-    def turn_right(self):
-        if self.target_cell is not None:
-            return
+    # def turn_right(self):
+    #     if self.target_cell is not None:
+    #         return
         
-        self.target_theta = (self.est_theta - np.pi / 2) % (2 * np.pi)
+    #     self.target_theta = (self.est_theta - np.pi / 2) % (2 * np.pi)
 
     def update(self, dt, renderer):
         ensure_transformed_shape(self)
-
-        # Control:
-        if self.target_cell is not None:
-            front_dist = np.linalg.norm(self.pos - self.sensor_data[TOFDirection.FRONT.value]) 
-            remaining_dist = CELL_SIZE - abs(self.start_front_tof - front_dist)
-            
-            print("Remaining distance to target cell:", remaining_dist)
-            
-            # PID gains
-            Kp = 1.0
-            Ki = 3.0
-            Kd = 0.5  # Derivative gain, tweak this
-
-            error = remaining_dist
-            self.linear_integrator += error * dt
-            derivative = (error - self.linear_prev_error) / dt
-
-            rpm = Kp * error + Ki * self.linear_integrator + Kd * derivative
-            rpm = np.clip(rpm, 10, self.u.move_rpm)
-
-            self.left_rpm = rpm
-            self.right_rpm = rpm
-            self.linear_prev_error = error
-
-            if remaining_dist < 0.05 * CELL_SIZE:
-                print("Reached target cell:", self.target_cell)
-                self.target_cell = None
-                self.start_front_tof = None
-                self.linear_integrator = 0.0
-                self.linear_prev_error = 0.0
-                self.left_rpm = 0
-                self.right_rpm = 0
-
-        _, _, est_theta = self.kalman.get_estimated_pose()
-        self.est_theta = est_theta % (2 * np.pi)  # Normalize to [0, 2π]
-
-        if self.target_theta is not None:
-            # Angular error in [-pi, pi]
-            error = (self.target_theta - est_theta + np.pi) % (2 * np.pi) - np.pi
-
-            # PID gains
-            Kp_theta = 3.0
-            Ki_theta = 5.0
-            Kd_theta = 1.0
-
-            self.angular_integrator += error * dt
-            derivative = (error - self.angular_prev_error) / dt
-
-            rpm_diff = Kp_theta * error + Ki_theta * self.angular_integrator + Kd_theta * derivative
-            rpm_diff = np.clip(rpm_diff, -self.u.turn_rpm, self.u.turn_rpm)
-
-            print(f"Turning to target theta: {np.rad2deg(self.target_theta)}, current: {np.rad2deg(est_theta)}, error: {np.rad2deg(error)}")
-
-            self.left_rpm = -rpm_diff
-            self.right_rpm = rpm_diff
-            self.angular_prev_error = error
-
-            if abs(error) < np.deg2rad(3):
-                print("Reached target theta:", np.rad2deg(self.target_theta))
-                self.target_theta = None
-                self.angular_integrator = 0.0
-                self.angular_prev_error = 0.0
-                self.left_rpm = 0
-                self.right_rpm = 0
 
         #print("Is wall front:", self.is_wall_front())
         #print("Is wall left:", self.is_wall_left())
         #print("Is wall right:", self.is_wall_right())
 
         self.cell_x = int((self.pos[0] - WALL_THICKNESS) // CELL_SIZE)
-        self.cell_y = int((self.pos[1] - WALL_THICKNESS) // CELL_SIZE)
+        self.cell_y = 15 - int((self.pos[1] - WALL_THICKNESS) // CELL_SIZE)
 
         #print(f"Cell: ({self.cell_x}, {self.cell_y})")
 
+        max_rpm = self.u.rpm_at_100_pwm
+        tau = 0.5  # seconds to reach ~100% rpm
+        decay_rate = max_rpm / tau  # linear fall
+
+        def compute_rpm(pwm, current_rpm):
+            pwm_frac = pwm / 100.0
+            target_rpm = max_rpm * pwm_frac**2
+
+            if pwm > 0:
+                # Exponential rise toward target
+                return target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
+            elif pwm < 0:
+                # Same model, just negative side
+                target_rpm = -max_rpm * pwm_frac**2
+                return target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
+            else:
+                # No input: linear decay toward zero
+                if current_rpm > 0:
+                    return max(0.0, current_rpm - decay_rate * dt)
+                elif current_rpm < 0:
+                    return min(0.0, current_rpm + decay_rate * dt)
+                else:
+                    return 0.0
+
+        self.left_rpm = compute_rpm(self.left_pwm, self.left_rpm)
+        self.right_rpm = compute_rpm(self.right_pwm, self.right_rpm)
+
+        print(f"Left 🛞 RPM: {self.left_rpm:.1f}, Right 🛞 RPM: {self.right_rpm:.1f}")
+        
         wr = self.u.wheel_radius * SCALE
         wb = self.u.wheel_base * SCALE
 
         # Convert to m/s and rad/s
-        v = (self.left_rpm + self.right_rpm) / 2 * (2 * math.pi * wr) / 60
-        omega = (self.right_rpm - self.left_rpm) * (2 * math.pi * wr) / (60 * wb)
+        circ = 2 * math.pi * wr
+        v = (self.left_rpm + self.right_rpm) / 2 * circ / 60
+        omega = (self.right_rpm - self.left_rpm) * circ / (60 * wb)
 
-        # Force and torque from v and omega
-        force_body = np.array([0, -v * self.mass / dt])
-        angle = -self.rot
+        angle = self.rot
         rotation_matrix = np.array([[math.cos(angle), -math.sin(angle)],
                                     [math.sin(angle), math.cos(angle)]])
-        force_world = np.dot(rotation_matrix, force_body)
-        torque = omega * self.rot_inertia / dt
+        v_world = rotation_matrix @ np.array([v, 0])
 
-        apply_force(self, force_world)
-        self.torque += torque
-
-        acc = self.force * self.inv_mass
-        self.vel += acc * dt
-
-        ang_acc = self.torque * self.inv_rot_inertia
-        self.ang_vel += ang_acc * dt
-
-        # Apply air drag
-        self.ang_vel *= self.u.drag
-
-        # Apply friction
-        if self.vel[0] != 0 or self.vel[1] != 0:
-            self.vel -= self.vel * (1 - self.u.friction)
+        self.vel = v_world.copy()
+        self.ang_vel = omega
 
         a = self
         for b in renderer.walls:
@@ -577,28 +532,28 @@ class Mouse(Body):
         
         self.dirty_transform = True
 
-        self.update_with_oracle(dt)
-        update_tof_sensor_data(self.sensor_data, self.pos, self.rot, renderer.walls_aabbs)
+        # self.update_with_oracle(dt)
+        self.sensor_data = update_tof_sensor_data_ray_marching(self.pos, self.rot, renderer.maze)
 
 
-    def update_with_oracle(self, dt):
-        left_rpm = self.left_rpm + random.gauss(0, 1) * NOISE_MAG
-        right_rpm = self.right_rpm + random.gauss(0, 1) * NOISE_MAG
+    # def update_with_oracle(self, dt):
+    #     left_rpm = self.left_rpm + random.gauss(0, 1) * NOISE_MAG
+    #     right_rpm = self.right_rpm + random.gauss(0, 1) * NOISE_MAG
 
-        #print(f"Left 🛞 RPM: {left_rpm:.1f}, Right 🛞 RPM: {right_rpm:.1f}")
+    #     #print(f"Left 🛞 RPM: {left_rpm:.1f}, Right 🛞 RPM: {right_rpm:.1f}")
 
-        wr = self.u.wheel_radius * SCALE
-        wb = self.u.wheel_base * SCALE
+    #     wr = self.u.wheel_radius * SCALE
+    #     wb = self.u.wheel_base * SCALE
         
-        # Reason about v and omega 
-        slip_factor = 0.95  # Empirical value (0.9-1.0)
-        measured_v = slip_factor * (left_rpm + right_rpm) / 2 * (2 * math.pi * wr) / 60
-        if abs(measured_v) < 0.001:  # Threshold for "stopped"
-            measured_v = 0
-        measured_omega = (right_rpm - left_rpm) / wb * (2 * math.pi * wr) / 60
+    #     # Reason about v and omega 
+    #     slip_factor = 0.95  # Empirical value (0.9-1.0)
+    #     measured_v = slip_factor * (left_rpm + right_rpm) / 2 * (2 * math.pi * wr) / 60
+    #     if abs(measured_v) < 0.001:  # Threshold for "stopped"
+    #         measured_v = 0
+    #     measured_omega = (right_rpm - left_rpm) / wb * (2 * math.pi * wr) / 60
         
-        # Simulate IMU measurement (angular velocity with noise)
-        imu_omega = self.ang_vel + random.gauss(0, 0.1) * NOISE_MAG   # rad/s noise
+    #     # Simulate IMU measurement (angular velocity with noise)
+    #     imu_omega = self.ang_vel + random.gauss(0, 0.1) * NOISE_MAG   # rad/s noise
 
         #imu_theta = self.rot + random.gauss(0, 0.05) * NOISE_MAG    # rad noise (if IMU has orientation)
         #imu_theta = (imu_theta + np.pi) % (2 * np.pi) - np.pi  # Convert to [-π, π]
@@ -607,40 +562,27 @@ class Mouse(Body):
 
         # Update Kalman filter with measurements
 
-        self.kalman.predict(measured_v, imu_omega, dt)
-        self.kalman.update_gyro(imu_omega)
-
         # Using TOF for position measurement, i.e. helping the Kalman filter
-        measured_x = self.pos[0] - STARTING_POS_OFFSET[0] + random.gauss(0, 1) * NOISE_MAG
-        measured_y = -(self.pos[1] - STARTING_POS_OFFSET[1]) + random.gauss(0, 1) * NOISE_MAG
+        # measured_x = self.pos[0] - STARTING_POS_OFFSET[0] + random.gauss(0, 1) * NOISE_MAG
+        # measured_y = -(self.pos[1] - STARTING_POS_OFFSET[1]) + random.gauss(0, 1) * NOISE_MAG
 
-        self.kalman.update_position(measured_x, measured_y)
+        # self.kalman.update_position(measured_x, measured_y)
 
     def draw(self, surface):
-        rotated_image = pg.transform.rotate(self.image, math.degrees(self.rot))
+        rotated_image = pg.transform.rotate(self.image, math.degrees(-self.rot - np.pi / 2))
         rotated_rect = rotated_image.get_rect(center=self.pos)
         surface.blit(rotated_image, rotated_rect)
+        
+        #est_dir = np.array([math.cos(est_theta), math.sin(est_theta)]) * 20
+        #draw_pos = np.array([est_x, est_y])
 
-        est_x, est_y, est_theta = self.kalman.get_estimated_pose()
-
-        est_dir = np.array([math.cos(est_theta), -math.sin(est_theta)]) * 20
-        draw_pos = STARTING_POS_OFFSET.copy() + np.array([est_x, -est_y])
-
-        pg.draw.circle(surface, (0, 255, 0), (int(draw_pos[0]), int(draw_pos[1])), 8)
-        pg.draw.line(surface, (0, 255, 0), (int(draw_pos[0]), int(draw_pos[1])),
-                     (int((draw_pos[0] + est_dir[0])), int((draw_pos[1] + est_dir[1]))), 2)
+        #pg.draw.circle(surface, (0, 255, 0), (int(draw_pos[0]), int(draw_pos[1])), 8)
+        #pg.draw.line(surface, (0, 255, 0), (int(draw_pos[0]), int(draw_pos[1])),
+        #             (int((draw_pos[0] + est_dir[0])), int((draw_pos[1] + est_dir[1]))), 2)
 
         for dir, point in enumerate(self.sensor_data):
             color = (255, 0, 0) if dir == 0 else (0, 255, 0)  # Front sensor in red, others in green
             pg.draw.line(surface, color, self.pos, point, 1)
-            
-            # Draw distance text with proper unit
-            distance = np.linalg.norm(point - self.pos) / SCALE
-
-            font = pg.font.SysFont(None, 20)
-            text = font.render(f"{distance:.1f}", True, (255, 255, 255))
-            text_pos = (self.pos + point) / 2
-            surface.blit(text, text_pos)
 
 class PgRenderer:
     width: int = MAZE_SIZE
@@ -653,7 +595,7 @@ class PgRenderer:
     mouse: Mouse
 
     clock: pg.time.Clock = pg.time.Clock()
-    pressed_keys: list[bool] = [False] * 1000
+    pressed_keys: list[bool] = [False] * 512
 
     def __init__(self, uber):
         self.uber = uber
@@ -662,6 +604,17 @@ class PgRenderer:
         pg.display.set_mode((1, 1))
 
         self.mouse = Mouse(uber)
+
+        for y in range(CELL_COUNT):
+            for x in range(CELL_COUNT):
+                cell = self.maze[y][x]
+
+                wall_top, wall_right, wall_bottom, wall_left = get_walls_from_maze_for(x, y)
+                cell.wall_top = wall_top
+                cell.wall_right = wall_right
+                cell.wall_bottom = wall_bottom
+                cell.wall_left = wall_left
+
 
         for y in range(CELL_COUNT):
             for x in range(CELL_COUNT):
@@ -676,64 +629,61 @@ class PgRenderer:
                     cell.wall_right = True
         self.refresh_walls()
 
-    def toggle_wall(self, x, y, direction, drag_id=None):
-        offset_x, offset_y = OFFSETS[direction]
-        neighbor_x, neighbor_y = x + offset_x, y + offset_y
+    # def toggle_wall(self, x, y, direction, drag_id=None):
+    #     offset_x, offset_y = OFFSETS[direction]
+    #     neighbor_x, neighbor_y = x + offset_x, y + offset_y
 
-        cell = self.maze[y][x]
+    #     cell = self.maze[y][x]
 
-        if not (0 <= neighbor_x < CELL_COUNT and 0 <= neighbor_y < CELL_COUNT):
-            neighbor = None
-        else:
-            neighbor = self.maze[neighbor_y][neighbor_x]
+    #     if not (0 <= neighbor_x < CELL_COUNT and 0 <= neighbor_y < CELL_COUNT):
+    #         neighbor = None
+    #     else:
+    #         neighbor = self.maze[neighbor_y][neighbor_x]
 
-        if cell.last_drag_ids[direction] == drag_id or neighbor.last_drag_ids[direction] == drag_id:
-            return  # Already handled
+    #     wall_attrs = {
+    #         Direction.TOP:    ("wall_top",    "wall_bottom"),
+    #         Direction.RIGHT:  ("wall_right",  "wall_left"),
+    #         Direction.BOTTOM: ("wall_bottom", "wall_top"),
+    #         Direction.LEFT:   ("wall_left",   "wall_right"),
+    #     }
 
-        wall_attrs = {
-            Direction.TOP:    ("wall_top",    "wall_bottom"),
-            Direction.RIGHT:  ("wall_right",  "wall_left"),
-            Direction.BOTTOM: ("wall_bottom", "wall_top"),
-            Direction.LEFT:   ("wall_left",   "wall_right"),
-        }
+    #     cell_attr, neighbor_attr = wall_attrs[direction]
 
-        cell_attr, neighbor_attr = wall_attrs[direction]
+    #     # Toggle the wall
+    #     wall_state = getattr(cell, cell_attr) or getattr(neighbor, neighbor_attr) if neighbor is not None else False
+    #     setattr(cell, cell_attr, not wall_state)
+    #     if neighbor is not None:
+    #         setattr(neighbor, neighbor_attr, False)
 
-        # Toggle the wall
-        wall_state = getattr(cell, cell_attr) or getattr(neighbor, neighbor_attr) if neighbor is not None else False
-        setattr(cell, cell_attr, not wall_state)
-        if neighbor is not None:
-            setattr(neighbor, neighbor_attr, False)
+    #     self.refresh_walls()
 
-        cell.last_drag_ids[direction] = drag_id
+    # def mouse_pressed_in_game(self, x, y, drag_id=None):
+    #     # Convert to maze coordinates
+    #     x, xr = divmod(x - WALL_THICKNESS, CELL_SIZE)
+    #     y, yr = divmod(y - WALL_THICKNESS, CELL_SIZE)
 
-        self.refresh_walls()
-
-    def mouse_pressed_in_game(self, x, y, drag_id=None):
-        # Convert to maze coordinates
-        x, xr = divmod(x - WALL_THICKNESS, CELL_SIZE)
-        y, yr = divmod(y - WALL_THICKNESS, CELL_SIZE)
-
-        if 0 <= x < CELL_COUNT and 0 <= y < CELL_COUNT:
-            if xr < yr:
-                if xr > CELL_SIZE // 2:
-                    self.toggle_wall(x, y, Direction.RIGHT, drag_id)
-                else:
-                    self.toggle_wall(x, y, Direction.LEFT, drag_id)
-            else:
-                if yr > CELL_SIZE // 2:
-                    self.toggle_wall(x, y, Direction.BOTTOM, drag_id)
-                else:
-                    self.toggle_wall(x, y, Direction.TOP, drag_id)
-            self.refresh_walls()
+    #     if 0 <= x < CELL_COUNT and 0 <= y < CELL_COUNT:
+    #         if xr < yr:
+    #             if xr > CELL_SIZE // 2:
+    #                 self.toggle_wall(x, y, Direction.RIGHT, drag_id)
+    #             else:
+    #                 self.toggle_wall(x, y, Direction.LEFT, drag_id)
+    #         else:
+    #             if yr > CELL_SIZE // 2:
+    #                 self.toggle_wall(x, y, Direction.BOTTOM, drag_id)
+    #             else:
+    #                 self.toggle_wall(x, y, Direction.TOP, drag_id)
+    #         self.refresh_walls()
 
     def keyPressEvent(self, event):
         key = event.key()
-        self.pressed_keys[key] = True
+        if key < len(self.pressed_keys):
+            self.pressed_keys[key] = True
 
     def keyReleaseEvent(self, event):
         key = event.key()
-        self.pressed_keys[key] = False
+        if key < len(self.pressed_keys):
+            self.pressed_keys[key] = False
 
     def refresh_walls(self):
         def add_wall(rect):
@@ -756,15 +706,16 @@ class PgRenderer:
         for y in range(CELL_COUNT):
             for x in range(CELL_COUNT):
                 cell = self.maze[y][x]
+                y = 15 - y
                 cx = x * CELL_SIZE + WALL_THICKNESS + WALL_THICKNESS // 2
                 cy = y * CELL_SIZE + WALL_THICKNESS + WALL_THICKNESS // 2
 
                 if cell.wall_top:
-                    add_wall(pg.Rect(cx, cy - WALL_THICKNESS // 2, CELL_SIZE, WALL_THICKNESS))
+                    add_wall(pg.Rect(cx, cy + CELL_SIZE - WALL_THICKNESS // 2, CELL_SIZE, WALL_THICKNESS))
                 if cell.wall_right:
                     add_wall(pg.Rect(cx + CELL_SIZE - WALL_THICKNESS // 2, cy, WALL_THICKNESS, CELL_SIZE))
                 if cell.wall_bottom:
-                    add_wall(pg.Rect(cx, cy + CELL_SIZE - WALL_THICKNESS // 2, CELL_SIZE, WALL_THICKNESS))
+                    add_wall(pg.Rect(cx, cy - WALL_THICKNESS // 2, CELL_SIZE, WALL_THICKNESS))
                 if cell.wall_left:
                     add_wall(pg.Rect(cx - WALL_THICKNESS // 2, cy, WALL_THICKNESS, CELL_SIZE))
                 
@@ -789,6 +740,8 @@ class PgRenderer:
                 px = x * CELL_SIZE + WALL_THICKNESS + WALL_THICKNESS // 2
                 py = y * CELL_SIZE + WALL_THICKNESS + WALL_THICKNESS // 2
                 pg.draw.circle(self.surface, (240, 240, 240), (px, py), WALL_THICKNESS // 2 + 1)
+
+        self.surface = pg.transform.flip(self.surface, False, True)
 
         return self.surface
 
