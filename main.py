@@ -6,6 +6,9 @@ import os
 import importlib 
 import subprocess 
 import threading
+import queue
+import time
+import signal
 
 os.environ["QT_API"] = "PyQt6"
 os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -13,7 +16,7 @@ os.environ["SDL_VIDEODRIVER"] = "dummy"
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, QTabWidget, QMenuBar, QMenu,
                              QVBoxLayout, QHBoxLayout, QWidget, QPlainTextEdit, QMessageBox, QLabel)
 from PySide6.QtGui import (QFont, QAction)
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, QObject, Signal
 
 from mission import Mission
 from renderer import PgRenderer, pg_surface_to_qimage
@@ -32,25 +35,26 @@ for m in tabs:
 
 example_mission = json.load(open(os.path.join(os.path.dirname(__file__), 'example_mission.json')))
 
-vertical_scroll_before_clear = None
-
 class MissionValueError(BaseException):
     def __init__(self, msg):
         self.msg = msg
 
+class TextEmitter(QObject):
+    append_text = Signal(str)
+    
 class TextBoxWriter:
     def __init__(self, text_box):
         self.text_box = text_box
 
     def write(self, text):
         self.text_box.insertPlainText(text)
-        if vertical_scroll_before_clear is not None:
-            self.text_box.verticalScrollBar().setValue(vertical_scroll_before_clear)
+        self.text_box.verticalScrollBar().setValue(self.text_box.verticalScrollBar().maximum())
 
     def flush(self):
         pass
 
 
+rpm_response_queue = queue.Queue()
 
 class TakeMySelfControl(QMainWindow):
     def __init__(self):
@@ -62,10 +66,21 @@ class TakeMySelfControl(QMainWindow):
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(16) 
 
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update)
+        self.update_timer.start(2)
+
+        self.last_update_time = None
+
         self.tabs = [globals()[m].Tab(self) for m in tabs]
 
         self.mission = None
         self.unsaved_changes = False
+
+        self.run_thread = None
+        self.running = False
+        self.process = None
+        self.should_stop = False
 
         self.setMinimumSize(1500, 700) 
 
@@ -108,6 +123,13 @@ class TakeMySelfControl(QMainWindow):
             self.mission = Mission(data)
             self.init_ui_for_mission()
 
+    def update(self):
+        if not self.pg_renderer or not self.mission:
+            return
+        
+        dt = self.pg_renderer.clock.tick() / 1000.0  # Convert milliseconds to seconds
+        self.pg_renderer.update(dt)
+
     def update_frame(self):
         if not self.pg_renderer or not self.mission:
             return
@@ -124,7 +146,7 @@ class TakeMySelfControl(QMainWindow):
     def mouse_pressed_in_game(self, x, y, drag_id=None):
         if not self.pg_renderer or not self.mission:
             return
-        self.pg_renderer.mouse_pressed_in_game(x, y, drag_id)
+        # self.pg_renderer.mouse_pressed_in_game(x, y, drag_id)
         
     def keyPressEvent(self, event):
         if not self.pg_renderer or not self.mission:
@@ -163,8 +185,12 @@ class TakeMySelfControl(QMainWindow):
         self.console_text_box.setFixedWidth(400)
 
         self.text_box = TextBoxWriter(self.console_text_box)
+        self.text_emitter = TextEmitter()
+        self.text_emitter.append_text.connect(lambda text: self.text_box.write(text))
 
         output_and_buttons.addWidget(self.console_text_box)
+
+        build_and_run = QVBoxLayout()
 
         build_and_build_status = QHBoxLayout()
 
@@ -174,40 +200,168 @@ class TakeMySelfControl(QMainWindow):
         build_status = QLabel(self)
         build_and_build_status.addWidget(build_status)
 
-        output_and_buttons.addLayout(build_and_build_status)
+        build_and_run.addLayout(build_and_build_status)
+
+        run_button = QPushButton('Run', self)
+        build_and_run.addWidget(run_button)
+
+        stop_button = QPushButton('Stop', self)
+        stop_button.setEnabled(False)
+        build_and_run.addWidget(stop_button)
+
+        output_and_buttons.addLayout(build_and_run)
+
+        def on_run_complete():
+            self.running = False
+            build_button.setEnabled(True)
+            run_button.setEnabled(True)
+            stop_button.setEnabled(False)
+            build_status.setText("Run complete.")
+            build_status.setStyleSheet("color: black;")
+
+        def run():
+            if not self.mission:
+                return
+            
+            if self.running:
+                print("Already running.")
+                return
+            
+            self.recalculate()
+
+            self.running = True
+            build_button.setEnabled(False)
+            run_button.setEnabled(False)
+            stop_button.setEnabled(True)
+
+            run_cmd = self.mission.run_command
+            dir = self.mission.directory
+            self.text_box.write("Running command: " + run_cmd + "\n\n")
+            
+            build_status.setText("Running...")
+            build_status.setStyleSheet("color: green;")
+
+            def worker():
+                try:
+                    self.should_stop = False
+                    self.process = subprocess.Popen(
+                        run_cmd,
+                        shell=True,
+                        cwd=dir,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        preexec_fn=os.setsid
+                    )
+
+                    # Read both streams concurrently using threads
+                    def read_stream(stream, label):
+                        for line in iter(stream.readline, ''):
+                            if self.should_stop:
+                                break
+
+                            if line.startswith(">>>"):
+                                parts = line.split()
+                                if len(parts) < 2:
+                                    self.text_emitter.append_text.emit(f">>> Error parsing command: {line.strip()}\n")
+                                    continue
+
+                                command = parts[1]
+                                if command == "setPWM":
+                                    if len(parts) < 4:
+                                        self.text_emitter.append_text.emit(f">>> Error parsing setPWM command: {line.strip()}\n")
+                                        continue
+                                    motor = parts[2].lower()
+                                    if motor != "left" and motor != "right":
+                                        self.text_emitter.append_text.emit(f">>> Unknown motor: {motor}\n")
+                                        continue
+
+                                    pwm = parts[3]
+                                    try:
+                                        pwm = float(pwm)
+                                        pwm = max(min(pwm, 100.0), -100.0)
+                                    except ValueError:
+                                        self.text_emitter.append_text.emit(f">>> Invalid PWM value: {pwm}\n")
+                                        continue
+
+                                    if motor == "left":
+                                        self.pg_renderer.mouse.left_pwm = pwm
+                                    else:
+                                        self.pg_renderer.mouse.right_pwm = pwm
+                                    continue
+
+                                if command == "readRPM":
+                                    if len(parts) < 3:
+                                        self.text_emitter.append_text.emit(f">>> Error parsing readRPM command: {line.strip()}\n")
+                                        continue
+                                    motor = parts[2].lower()
+                                    if motor != "left" and motor != "right":
+                                        self.text_emitter.append_text.emit(f">>> Unknown motor: {motor}\n")
+                                        continue
+
+                                    rpm_value = self.pg_renderer.mouse.left_rpm if motor == "left" else self.pg_renderer.mouse.right_rpm
+                                    self.process.stdin.write(f"{rpm_value}\n")
+                                    self.process.stdin.flush()
+                                    continue
+                            else:
+                                self.text_emitter.append_text.emit(f"{line.strip()}\n")
+
+                    stdout_thread = threading.Thread(target=read_stream, args=(self.process.stdout, "stdout"))
+                    stderr_thread = threading.Thread(target=read_stream, args=(self.process.stderr, "stderr"))
+
+                    stdout_thread.start()
+                    stderr_thread.start()
+                    stdout_thread.join()
+                    stderr_thread.join()
+
+                    self.process.stdout.close()
+                    self.process.stderr.close()
+                    self.process.wait()
+                except Exception as e:
+                    self.text_box.write(f"Exception running command: {e}\n")
+
+                on_run_complete()
+
+            self.run_thread = threading.Thread(target=worker, daemon=True).start()
+
+        run_button.clicked.connect(run)
+
+        def stop():
+            if self.process:
+                try:
+                    self.should_stop = True
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                    self.process.wait()
+                    self.process = None
+                except Exception as e:
+                    self.text_box.write(f"Error stopping process: {e}\n")
+                on_run_complete()
+
+        stop_button.clicked.connect(stop)
 
         def build():
             self.recalculate()
 
-            old = sys.stdout
-            old_err = sys.stderr
-
-            sys.stdout = self.text_box
-            sys.stderr = self.text_box
-
-            print("")
+            run_button.setEnabled(False)
+            build_button.setEnabled(False)
 
             build_cmd = self.mission.build_command
             dir = self.mission.directory
-            print("Running command:", build_cmd)
+            self.text_box.write("Running command: " + build_cmd + "\n\n")
 
             build_status.setText("Building...")
             build_status.setStyleSheet("color: orange;")
 
-            def on_complete(success, output):
+            def on_complete(success):
                 if success:
                     build_status.setText("Complete.")
                     build_status.setStyleSheet("color: green;")
                 else:
                     build_status.setText("Failed.")
                     build_status.setStyleSheet("color: red;")
-                print(output)
-                       
-                sys.stdout = old
-                sys.stderr = old_err
-
-            stdout_pipe = subprocess.PIPE
-            stderr_pipe = subprocess.PIPE
+                run_button.setEnabled(True)
+                build_button.setEnabled(True)
 
             def worker():
                 try:
@@ -215,30 +369,34 @@ class TakeMySelfControl(QMainWindow):
                         build_cmd,
                         shell=True,
                         cwd=dir,
-                        stdout=stdout_pipe,
-                        stderr=stderr_pipe,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         text=True
                     )
-                    stdout_lines = []
-                    stderr_lines = []
 
-                    for stdout_line in iter(process.stdout.readline, ""):
-                        stdout_lines.append(stdout_line)
-                        print(stdout_line, end="")  # Also print to console or UI
-                    for stderr_line in iter(process.stderr.readline, ""):
-                        stderr_lines.append(stderr_line)
-                        print(stderr_line, end="")  # Also print to console or UI
-                    
+                    # Read both streams concurrently using threads
+                    def read_stream(stream, label):
+                        for line in iter(stream.readline, ''):
+                            self.text_emitter.append_text.emit(f"{line.strip()}\n")
+
+                    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, "stdout"))
+                    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, "stderr"))
+
+                    stdout_thread.start()
+                    stderr_thread.start()
+                    stdout_thread.join()
+                    stderr_thread.join()
+
                     process.stdout.close()
                     process.stderr.close()
-                    process.wait()  # Wait for the process to terminate
-                    
+                    process.wait()
+
                     success = process.returncode == 0
-                    output = "".join(stdout_lines) + "".join(stderr_lines)
                 except Exception as e:
                     success = False
-                    output = str(e)
-                on_complete(success, output)
+                    self.text_box.write(f"Exception running command: {e}\n")
+
+                on_complete(success)
 
             threading.Thread(target=worker, daemon=True).start()
          
@@ -271,9 +429,6 @@ class TakeMySelfControl(QMainWindow):
         
         old = sys.stdout
         sys.stdout = self.text_box
-
-        global vertical_scroll_before_clear
-        vertical_scroll_before_clear = self.console_text_box.verticalScrollBar().value()
 
         self.console_text_box.clear()
 

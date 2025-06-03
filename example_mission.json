@@ -1,10 +1,10 @@
 {
     "rpm_at_100_pwm": 1000.0,
     "wasd_move_pwm": 100,
-    "wasd_turn_pwm": 50.0,
+    "wasd_turn_pwm": 60.0,
     "wheel_radius": 2.1,
     "wheel_base": 8.0,
     "directory": "/Users/soti/DevLocal/SourceCode",
-    "run_command": "./a.out",
+    "run_command": "./build/a.out",
     "build_command": "sh ./build.sh"
 }

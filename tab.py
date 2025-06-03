@@ -205,4 +205,3 @@ class Tab(QFormLayout):
     def update_frame(self):
         if self.pg_widget:
             self.pg_widget.update()
-

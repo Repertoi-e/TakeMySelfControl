@@ -349,29 +349,34 @@ class Mouse(Body):
 
         self.left_rpm = 0.0
         self.right_rpm = 0.0
+        self.input_left_pwm = 0.0
+        self.input_right_pwm = 0.0
+
         self.cell_x = 0
         self.cell_y = 0
+
+        self.rot = np.pi / 2
 
         self.sensor_data = [np.zeros(2) for _ in range(5)]
 
         self.image = pg.image.load("sprite.png").convert_alpha()
 
     def handle_input(self, keys):
-        self.left_pwm = 0
-        self.right_pwm = 0
+        self.input_left_pwm = 0.0
+        self.input_right_pwm = 0.0
 
         if keys[Qt.Key_W]:
-            self.left_pwm += self.u.wasd_move_pwm
-            self.right_pwm += self.u.wasd_move_pwm
+            self.input_left_pwm = self.u.wasd_move_pwm
+            self.input_right_pwm = self.u.wasd_move_pwm
         if keys[Qt.Key_S]:
-            self.left_pwm -= self.u.wasd_move_pwm
-            self.right_pwm -= self.u.wasd_move_pwm
+            self.input_left_pwm = -self.u.wasd_move_pwm
+            self.input_right_pwm = -self.u.wasd_move_pwm
         if keys[Qt.Key_A]:
-            self.right_pwm += self.u.wasd_turn_pwm
-            self.left_pwm -= self.u.wasd_turn_pwm
+            self.input_left_pwm = -self.u.wasd_turn_pwm
+            self.input_right_pwm = self.u.wasd_turn_pwm
         if keys[Qt.Key_D]:
-            self.right_pwm -= self.u.wasd_turn_pwm
-            self.left_pwm += self.u.wasd_turn_pwm
+            self.input_left_pwm = self.u.wasd_turn_pwm
+            self.input_right_pwm = -self.u.wasd_turn_pwm
 
     # def is_wall_front(self): 
     #     front_tof = self.sensor_data[TOFDirection.FRONT.value]
@@ -450,18 +455,13 @@ class Mouse(Body):
         tau = 0.5  # seconds to reach ~100% rpm
         decay_rate = max_rpm / tau  # linear fall
 
-        def compute_rpm(pwm, current_rpm):
-            pwm_frac = pwm / 100.0
-            target_rpm = max_rpm * pwm_frac**2
+        def _compute_rpm_single(effective_pwm, current_rpm):
+            """
+            Computes the new RPM for a single motor based on the effective PWM and current RPM.
+            """
+            decay_rate = max_rpm / tau  # Linear decay rate when PWM is 0
 
-            if pwm > 0:
-                # Exponential rise toward target
-                return target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
-            elif pwm < 0:
-                # Same model, just negative side
-                target_rpm = -max_rpm * pwm_frac**2
-                return target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
-            else:
+            if effective_pwm == 0:
                 # No input: linear decay toward zero
                 if current_rpm > 0:
                     return max(0.0, current_rpm - decay_rate * dt)
@@ -469,11 +469,44 @@ class Mouse(Body):
                     return min(0.0, current_rpm + decay_rate * dt)
                 else:
                     return 0.0
+            else:
+                # PWM is non-zero: Exponential rise/fall toward target_rpm
+                pwm_frac = effective_pwm / 100.0 # Normalize PWM to -1.0 to 1.0
+                
+                # Target RPM calculation:
+                # The magnitude of target RPM is proportional to the square of pwm_frac.
+                # The sign of target RPM matches the sign of effective_pwm.
+                # This gives finer control at lower PWM values.
+                # e.g., pwm_frac = 0.5 (50% PWM) => (0.5)^2 = 0.25 => 25% of max_rpm
+                # e.g., pwm_frac = -0.5 (-50% PWM) => (-0.5)^2 = 0.25 => -25% of max_rpm
+                
+                target_rpm_magnitude_factor = pwm_frac**2 # This is always positive
 
-        self.left_rpm = compute_rpm(self.left_pwm, self.left_rpm)
-        self.right_rpm = compute_rpm(self.right_pwm, self.right_rpm)
+                if effective_pwm > 0:
+                    target_rpm = max_rpm * target_rpm_magnitude_factor
+                else: # effective_pwm < 0
+                    target_rpm = -max_rpm * target_rpm_magnitude_factor
+                
+                # Exponential approach to target_rpm:
+                # new_rpm = target_rpm + (current_rpm - target_rpm) * exp(-dt / tau)
+                # This can be rewritten as:
+                # new_rpm = target_rpm * (1 - exp(-dt/tau)) + current_rpm * exp(-dt/tau)
+                # Your formulation is: target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
+                # Let exp_val = math.exp(-dt / tau).
+                # new_rpm = target_rpm - target_rpm * exp_val + current_rpm * exp_val
+                # new_rpm = target_rpm * (1 - exp_val) + current_rpm * exp_val. This is correct.
+                return target_rpm - (target_rpm - current_rpm) * math.exp(-dt / tau)
 
-        print(f"Left 🛞 RPM: {self.left_rpm:.1f}, Right 🛞 RPM: {self.right_rpm:.1f}")
+        combined_left_pwm = self.left_pwm + self.input_left_pwm
+        combined_right_pwm = self.right_pwm + self.input_right_pwm
+
+        clamped_left_pwm = max(-100.0, min(100.0, combined_left_pwm))
+        clamped_right_pwm = max(-100.0, min(100.0, combined_right_pwm))
+
+        self.left_rpm = _compute_rpm_single(clamped_left_pwm, self.left_rpm)
+        self.right_rpm = _compute_rpm_single(clamped_right_pwm, self.right_rpm)
+
+        print(f"Left 🛞 RPM: {self.left_rpm:.1f}, Right 🛞 RPM: {self.right_rpm:.1f}, left pwm: {clamped_left_pwm}, right pwm: {clamped_right_pwm}") 
         
         wr = self.u.wheel_radius * SCALE
         wb = self.u.wheel_base * SCALE
@@ -508,9 +541,9 @@ class Mouse(Body):
                 
                 allowed_penetration = 0.01
                 position_bias_factor = 0.2
-        
-                c.bias = -position_bias_factor * 1 / dt * min(0, -c.collision_depth + allowed_penetration)
-            
+
+                c.bias = -position_bias_factor * 1 / (dt + 1e-6) * min(0, -c.collision_depth + allowed_penetration)
+
             # Perform iterations
             for _ in range(10):
                 for c in contacts:
@@ -719,16 +752,15 @@ class PgRenderer:
                 if cell.wall_left:
                     add_wall(pg.Rect(cx - WALL_THICKNESS // 2, cy, WALL_THICKNESS, CELL_SIZE))
                 
-    
+    def update(self, dt):
+        self.mouse.handle_input(self.pressed_keys)
+        self.mouse.update(dt, self)
+
     def render(self):
         self.surface.fill((0, 0, 0))
 
-        dt = self.clock.tick(60) / 1000.0
-
-        self.mouse.handle_input(self.pressed_keys)
-        self.mouse.update(dt, self)
         self.mouse.draw(self.surface)
-
+        
         for wall in self.walls:
             aabb = wall.transformed_shape.aabb
             m = aabb[0] - aabb[1]
